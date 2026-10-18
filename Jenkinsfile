@@ -101,7 +101,7 @@ pipeline {
       }
     }
 
-    stage('Deploy monitoring') {
+    stage('Apply monitoring chart') {
       when {
         expression { params.ACTION == 'DEPLOY' }
       }
@@ -137,8 +137,9 @@ pipeline {
               --from-literal=admin-password="$GRAFANA_ADMIN_PASSWORD" \
               --dry-run=client -o yaml | kubectl apply -f -
 
-            helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-            helm repo update prometheus-community
+            if ! helm repo list | awk 'NR > 1 && $1 == "prometheus-community" { found=1 } END { exit !found }'; then
+              helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+            fi
             helm upgrade --install "$RELEASE_NAME" \
               prometheus-community/kube-prometheus-stack \
               --namespace "$NAMESPACE" \
@@ -146,21 +147,53 @@ pipeline {
               --values values.yaml \
               --set-string "grafana.service.loadBalancerSourceRanges[0]=$JENKINS_PUBLIC_IP/32" \
               --set-file grafana.dashboards.default.aks-infrastructure.json=dashboards/aks-infrastructure.json \
-              --wait \
-              --timeout 15m
-
-            kubectl wait \
-              --for=jsonpath='{.status.loadBalancer.ingress[0].ip}' \
-              "service/$RELEASE_NAME-grafana" \
-              --namespace "$NAMESPACE" \
-              --timeout=10m
-            grafana_ip="$(kubectl get service "$RELEASE_NAME-grafana" \
-              --namespace "$NAMESPACE" \
-              --output=jsonpath='{.status.loadBalancer.ingress[0].ip}')"
-            test -n "$grafana_ip"
-            echo "Grafana GUI URL: http://$grafana_ip/"
+              --timeout 5m
           '''
         }
+      }
+    }
+
+    stage('Wait for monitoring pods') {
+      when {
+        expression { params.ACTION == 'DEPLOY' }
+      }
+      steps {
+        sh '''
+          set -eu
+          if ! kubectl wait \
+            --for=condition=Ready \
+            pod \
+            --all \
+            --selector "app.kubernetes.io/instance=$RELEASE_NAME" \
+            --namespace "$NAMESPACE" \
+            --timeout=5m; then
+            echo 'Monitoring pods did not become Ready within 5 minutes. Current pod and PVC status:' >&2
+            kubectl get pods --namespace "$NAMESPACE" --selector "app.kubernetes.io/instance=$RELEASE_NAME" --output=wide
+            kubectl get pvc --namespace "$NAMESPACE"
+            exit 1
+          fi
+        '''
+      }
+    }
+
+    stage('Wait for Grafana LoadBalancer') {
+      when {
+        expression { params.ACTION == 'DEPLOY' }
+      }
+      steps {
+        sh '''
+          set -eu
+          kubectl wait \
+            --for=jsonpath='{.status.loadBalancer.ingress[0].ip}' \
+            "service/$RELEASE_NAME-grafana" \
+            --namespace "$NAMESPACE" \
+            --timeout=5m
+          grafana_ip="$(kubectl get service "$RELEASE_NAME-grafana" \
+            --namespace "$NAMESPACE" \
+            --output=jsonpath='{.status.loadBalancer.ingress[0].ip}')"
+          test -n "$grafana_ip"
+          echo "Grafana GUI URL: http://$grafana_ip/"
+        '''
       }
     }
 
@@ -196,6 +229,7 @@ pipeline {
         '''
       }
     }
+
   }
 
   post {

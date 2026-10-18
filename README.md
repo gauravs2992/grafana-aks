@@ -6,14 +6,14 @@ This Jenkins pipeline installs the `kube-prometheus-stack` Helm chart into an **
 
 - A provisioned **AKS Infrastructure** Grafana dashboard with cluster CPU and memory, node count/readiness, and node utilization panels.
 - Prometheus rules for NotReady nodes, sustained high node CPU, low node memory, CrashLooping pods, and nearly full node filesystems.
-- A public Grafana LoadBalancer restricted to the Jenkins VM's public outbound IPv4 address (`/32`). Prometheus and Alertmanager remain private in-cluster services.
+- Grafana is exposed by an Azure public LoadBalancer restricted to the Jenkins VM's public outbound IPv4 address (`/32`). Prometheus and Alertmanager remain private in-cluster services.
 - Persistent claims for Grafana (10 GiB), Prometheus (20 GiB, 15-day retention), and Alertmanager (2 GiB). The cluster's default storage class must support dynamically provisioned `ReadWriteOnce` volumes.
 
 These are Kubernetes node and workload statistics. AKS control-plane metrics are not exposed by node-exporter or kube-state-metrics; use Azure Monitor managed Prometheus and Azure Managed Grafana if control-plane metrics are required.
 
 ## Jenkins setup
 
-Create a Pipeline job whose SCM repository root is `grafana-aks` and whose script path is `Jenkinsfile`. Run it on a **Linux** Jenkins agent with Azure CLI (`az`), `kubectl`, and Helm 3 installed. The agent must be able to reach the AKS API endpoint over HTTPS (TCP 443).
+Create a Pipeline job whose SCM repository root is `grafana-aks` and whose script path is `Jenkinsfile`. Run it on a **Linux** Jenkins agent with Azure CLI (`az`), `kubectl`, and Helm 3 installed. The agent must be able to reach the AKS API endpoint over HTTPS (TCP 443). Keep the Jenkins agent's Helm repository cache between builds where possible: the pipeline adds the pinned chart repository only when missing and does not refresh the full chart index on every run.
 
 Configure these Jenkins credentials:
 
@@ -51,7 +51,7 @@ Change the resource group and cluster name to match your deployment. The default
 
 ## View the dashboard and alerts
 
-On `DEPLOY`, the Jenkins build waits for Azure to assign the Grafana service's external IP and prints a line in the build log:
+On `DEPLOY`, Jenkins applies the chart, waits up to 5 minutes for monitoring pods to become Ready, then waits up to 5 minutes for Azure to assign the Grafana service's external IP. Each check has its own stage so the build log shows which operation is taking time. On a pod timeout, it prints pod and PVC status for diagnosis. The build prints the Grafana URL:
 
 ```text
 Grafana GUI URL: http://<EXTERNAL-IP>/
@@ -59,7 +59,7 @@ Grafana GUI URL: http://<EXTERNAL-IP>/
 
 Open the printed URL from a client whose outbound internet traffic uses the configured `JENKINS_PUBLIC_IP`, then sign in as `admin` with the password stored in the Jenkins credential `grafana-admin-password`. The dashboard is in **Dashboards → AKS Infrastructure**. You can also retrieve the address later with `kubectl -n monitoring get service aks-observability-grafana`; replace `monitoring` if you selected another namespace.
 
-The Jenkins IP must be the public **outbound/source** address seen by the Azure LoadBalancer, not necessarily an IP attached to the VM if outbound traffic is SNATed through a NAT Gateway, firewall, or proxy. If your browser does not egress through that address, the firewall correctly blocks it; use a browser/network routed through Jenkins' egress or change the allowlist to your browser's fixed public IP. This chart serves Grafana over HTTP, not HTTPS; the restricted allowlist reduces exposure but does not encrypt login traffic. For production use, terminate TLS with a trusted certificate before exposing Grafana.
+The Jenkins IP must be the public **outbound/source** address seen by the Azure LoadBalancer, not necessarily an IP attached to the VM if outbound traffic is SNATed through a NAT Gateway, firewall, or proxy. If your browser does not egress through that address, the firewall blocks it; use a browser/network routed through Jenkins' egress or change the allowlist to your browser's fixed public IP. This chart serves Grafana over HTTP, not HTTPS; the restricted allowlist reduces exposure but does not encrypt login traffic. For production use, terminate TLS with a trusted certificate before exposing Grafana.
 
 Inspect active and pending alert rules in Grafana under **Alerting → Alert rules**, or forward Alertmanager:
 
