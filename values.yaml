@@ -1,0 +1,103 @@
+grafana:
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+  service:
+    type: ClusterIP
+  persistence:
+    enabled: true
+    size: 10Gi
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: default
+          orgId: 1
+          folder: ""
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/default
+  dashboards:
+    default:
+      aks-infrastructure: {}
+
+prometheus:
+  prometheusSpec:
+    retention: 15d
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 20Gi
+
+alertmanager:
+  alertmanagerSpec:
+    storage:
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 2Gi
+
+additionalPrometheusRulesMap:
+  aks-infrastructure-alerts:
+    groups:
+      - name: aks-infrastructure
+        rules:
+          - alert: AKSNodeNotReady
+            expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: AKS node is not ready
+              description: "Node {{ $labels.node }} has been reporting NotReady for more than 5 minutes."
+          - alert: AKSNodeHighCPU
+            expr: |
+              sum by (instance) (rate(node_cpu_seconds_total{mode!="idle"}[5m]))
+              /
+              count by (instance) (node_cpu_seconds_total{mode="idle"})
+              > 0.85
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: AKS node CPU usage is high
+              description: "Node {{ $labels.instance }} CPU usage has exceeded 85% for 10 minutes."
+          - alert: AKSNodeLowMemory
+            expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.10
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: AKS node available memory is low
+              description: "Node {{ $labels.instance }} has less than 10% available memory for 10 minutes."
+          - alert: AKSPodCrashLooping
+            expr: max_over_time(kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"}[5m]) > 0
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: Pod container is crash looping
+              description: "Container {{ $labels.container }} in pod {{ $labels.namespace }}/{{ $labels.pod }} is crash looping."
+          - alert: AKSNodeFilesystemNearlyFull
+            expr: |
+              (
+                node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}
+                /
+                node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}
+              ) < 0.10
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: AKS node filesystem is nearly full
+              description: "Filesystem {{ $labels.mountpoint }} on {{ $labels.instance }} has less than 10% space available."
