@@ -6,7 +6,7 @@ This Jenkins pipeline installs the `kube-prometheus-stack` Helm chart into an **
 
 - A provisioned **AKS Infrastructure** Grafana dashboard with cluster CPU and memory, node count/readiness, and node utilization panels.
 - Prometheus rules for NotReady nodes, sustained high node CPU, low node memory, CrashLooping pods, and nearly full node filesystems.
-- Private `ClusterIP` services for Grafana, Prometheus, and Alertmanager. Nothing is exposed through a public LoadBalancer or Ingress.
+- A public Grafana LoadBalancer restricted to the Jenkins VM's public outbound IPv4 address (`/32`). Prometheus and Alertmanager remain private in-cluster services.
 - Persistent claims for Grafana (10 GiB), Prometheus (20 GiB, 15-day retention), and Alertmanager (2 GiB). The cluster's default storage class must support dynamically provisioned `ReadWriteOnce` volumes.
 
 These are Kubernetes node and workload statistics. AKS control-plane metrics are not exposed by node-exporter or kube-state-metrics; use Azure Monitor managed Prometheus and Azure Managed Grafana if control-plane metrics are required.
@@ -33,6 +33,7 @@ The Jenkins parameters are:
 | `ACTION` | `DEPLOY` | `DEPLOY` installs/upgrades the stack; `UNINSTALL` removes the Helm release |
 | `AZURE_RESOURCE_GROUP` | `rg-aks-test` | Resource group of the existing AKS cluster |
 | `AKS_CLUSTER_NAME` | `aks-test-cluster` | Existing AKS cluster name |
+| `JENKINS_PUBLIC_IP` | *(required for `DEPLOY`)* | Jenkins VM public outbound IPv4 address; the Grafana service allows only this address |
 | `NAMESPACE` | `monitoring` | Namespace for all monitoring components |
 | `CHART_VERSION` | `72.6.2` | Pinned `kube-prometheus-stack` Helm chart version |
 | `DELETE_PVC` | `false` | With `UNINSTALL`, explicitly delete the monitoring PVCs and their data |
@@ -46,17 +47,19 @@ Change the resource group and cluster name to match your deployment. The default
 3. `kubectl` and Helm use that kubeconfig to talk directly to the Kubernetes API endpoint over TLS/HTTPS (TCP 443). Azure login by itself does not provide network access: the agent must have a route to the endpoint and Kubernetes authorization.
 4. Helm installs the chart resources into the `monitoring` namespace (or the selected namespace). Prometheus discovers Kubernetes targets and scrapes kubelet/container and node-exporter metrics; kube-state-metrics exposes Kubernetes object state.
 5. Grafana queries the in-cluster Prometheus service. Prometheus evaluates the provisioned rules and sends firing alerts to the in-cluster Alertmanager service.
-6. Dashboard access is through a deliberate, authenticated operator path such as `kubectl port-forward`; no public service is created by this configuration.
+6. Grafana is exposed by an Azure public LoadBalancer, with Kubernetes `loadBalancerSourceRanges` restricting inbound access to the Jenkins VM public outbound IP as a single-address `/32`. Prometheus and Alertmanager are not exposed publicly.
 
 ## View the dashboard and alerts
 
-From an authorized machine with cluster network access and a suitable kubeconfig, forward Grafana locally:
+On `DEPLOY`, the Jenkins build waits for Azure to assign the Grafana service's external IP and prints a line in the build log:
 
-```sh
-kubectl -n monitoring port-forward service/aks-observability-grafana 3000:80
+```text
+Grafana GUI URL: http://<EXTERNAL-IP>/
 ```
 
-These commands use the default `NAMESPACE=monitoring`; replace `monitoring` if you deployed into a different namespace. Open `http://localhost:3000`, sign in as `admin`, and use the password stored in the Jenkins credential `grafana-admin-password`. The dashboard is in **Dashboards → AKS Infrastructure**.
+Open the printed URL from a client whose outbound internet traffic uses the configured `JENKINS_PUBLIC_IP`, then sign in as `admin` with the password stored in the Jenkins credential `grafana-admin-password`. The dashboard is in **Dashboards → AKS Infrastructure**. You can also retrieve the address later with `kubectl -n monitoring get service aks-observability-grafana`; replace `monitoring` if you selected another namespace.
+
+The Jenkins IP must be the public **outbound/source** address seen by the Azure LoadBalancer, not necessarily an IP attached to the VM if outbound traffic is SNATed through a NAT Gateway, firewall, or proxy. If your browser does not egress through that address, the firewall correctly blocks it; use a browser/network routed through Jenkins' egress or change the allowlist to your browser's fixed public IP. This chart serves Grafana over HTTP, not HTTPS; the restricted allowlist reduces exposure but does not encrypt login traffic. For production use, terminate TLS with a trusted certificate before exposing Grafana.
 
 Inspect active and pending alert rules in Grafana under **Alerting → Alert rules**, or forward Alertmanager:
 

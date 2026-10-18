@@ -23,6 +23,11 @@ pipeline {
       description: 'Name of the existing AKS cluster.'
     )
     string(
+      name: 'JENKINS_PUBLIC_IP',
+      defaultValue: '',
+      description: 'Jenkins VM outbound public IPv4 address; Grafana access is restricted to this address.'
+    )
+    string(
       name: 'NAMESPACE',
       defaultValue: 'monitoring',
       description: 'Kubernetes namespace for Prometheus, Grafana, and Alertmanager.'
@@ -108,6 +113,23 @@ pipeline {
             set -eu
             set +x
             test -n "$GRAFANA_ADMIN_PASSWORD"
+            if [ -z "$JENKINS_PUBLIC_IP" ] || ! printf '%s\n' "$JENKINS_PUBLIC_IP" | awk -F. '
+              NF != 4 { exit 1 }
+              {
+                for (i = 1; i <= 4; i++) {
+                  if ($i !~ /^[0-9]+$/ || $i + 0 > 255) exit 1
+                }
+                if ($1 + 0 == 0 || $1 + 0 == 10 || $1 + 0 == 127 ||
+                    ($1 + 0 == 169 && $2 + 0 == 254) ||
+                    ($1 + 0 == 172 && $2 + 0 >= 16 && $2 + 0 <= 31) ||
+                    ($1 + 0 == 192 && $2 + 0 == 168) ||
+                    ($1 + 0 == 100 && $2 + 0 >= 64 && $2 + 0 <= 127) ||
+                    $1 + 0 >= 224) exit 1
+              }
+            '; then
+              echo 'JENKINS_PUBLIC_IP must be the Jenkins VM public outbound IPv4 address.' >&2
+              exit 1
+            fi
             kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
             kubectl create secret generic grafana-admin \
               --namespace "$NAMESPACE" \
@@ -122,9 +144,21 @@ pipeline {
               --namespace "$NAMESPACE" \
               --version "$CHART_VERSION" \
               --values values.yaml \
+              --set-string "grafana.service.loadBalancerSourceRanges[0]=$JENKINS_PUBLIC_IP/32" \
               --set-file grafana.dashboards.default.aks-infrastructure.json=dashboards/aks-infrastructure.json \
               --wait \
               --timeout 15m
+
+            kubectl wait \
+              --for=jsonpath='{.status.loadBalancer.ingress[0].ip}' \
+              "service/$RELEASE_NAME-grafana" \
+              --namespace "$NAMESPACE" \
+              --timeout=10m
+            grafana_ip="$(kubectl get service "$RELEASE_NAME-grafana" \
+              --namespace "$NAMESPACE" \
+              --output=jsonpath='{.status.loadBalancer.ingress[0].ip}')"
+            test -n "$grafana_ip"
+            echo "Grafana GUI URL: http://$grafana_ip/"
           '''
         }
       }
@@ -139,6 +173,7 @@ pipeline {
           set -eu
           kubectl get pods --namespace "$NAMESPACE"
           kubectl get services --namespace "$NAMESPACE"
+          kubectl get service "$RELEASE_NAME-grafana" --namespace "$NAMESPACE"
           kubectl get prometheusrules --namespace "$NAMESPACE"
         '''
       }

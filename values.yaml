@@ -4,7 +4,9 @@ grafana:
     userKey: admin-user
     passwordKey: admin-password
   service:
-    type: ClusterIP
+    type: LoadBalancer
+    loadBalancerSourceRanges:
+      - 127.0.0.1/32
   persistence:
     enabled: true
     size: 10Gi
