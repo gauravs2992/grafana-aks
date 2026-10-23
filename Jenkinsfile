@@ -25,7 +25,12 @@ pipeline {
     string(
       name: 'JENKINS_PUBLIC_IP',
       defaultValue: '',
-      description: 'Jenkins VM outbound public IPv4 address; Grafana access is restricted to this address.'
+      description: 'Jenkins VM outbound public IPv4 source address; used for access filtering only, not assigned to Grafana.'
+    )
+    string(
+      name: 'GRAFANA_ALLOWED_SOURCE_CIDR',
+      defaultValue: '',
+      description: 'Optional browser/client public IPv4 CIDR allowed to reach Grafana, e.g. 203.0.113.25/32. Defaults to Jenkins outbound IP.'
     )
     string(
       name: 'NAMESPACE',
@@ -130,6 +135,26 @@ pipeline {
               echo 'JENKINS_PUBLIC_IP must be the Jenkins VM public outbound IPv4 address.' >&2
               exit 1
             fi
+            grafana_allowed_source_cidr="${GRAFANA_ALLOWED_SOURCE_CIDR:-$JENKINS_PUBLIC_IP/32}"
+            if ! printf '%s\n' "$grafana_allowed_source_cidr" | awk -F/ '
+              NF != 2 || $2 !~ /^[0-9]+$/ || $2 + 0 > 32 { exit 1 }
+              {
+                count = split($1, octets, ".")
+                if (count != 4) exit 1
+                for (i = 1; i <= 4; i++) {
+                  if (octets[i] !~ /^[0-9]+$/ || octets[i] + 0 > 255) exit 1
+                }
+                if (octets[1] + 0 == 0 || octets[1] + 0 == 10 || octets[1] + 0 == 127 ||
+                    (octets[1] + 0 == 169 && octets[2] + 0 == 254) ||
+                    (octets[1] + 0 == 172 && octets[2] + 0 >= 16 && octets[2] + 0 <= 31) ||
+                    (octets[1] + 0 == 192 && octets[2] + 0 == 168) ||
+                    (octets[1] + 0 == 100 && octets[2] + 0 >= 64 && octets[2] + 0 <= 127) ||
+                    octets[1] + 0 >= 224) exit 1
+              }
+            '; then
+              echo 'GRAFANA_ALLOWED_SOURCE_CIDR must be a public IPv4 CIDR such as 203.0.113.25/32.' >&2
+              exit 1
+            fi
             kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
             kubectl create secret generic grafana-admin \
               --namespace "$NAMESPACE" \
@@ -145,7 +170,7 @@ pipeline {
               --namespace "$NAMESPACE" \
               --version "$CHART_VERSION" \
               --values values.yaml \
-              --set-string "grafana.service.loadBalancerSourceRanges[0]=$JENKINS_PUBLIC_IP/32" \
+              --set-string "grafana.service.loadBalancerSourceRanges[0]=$grafana_allowed_source_cidr" \
               --set-file grafana.dashboards.default.aks-infrastructure.json=dashboards/aks-infrastructure.json \
               --timeout 5m
           '''
@@ -183,11 +208,18 @@ pipeline {
       steps {
         sh '''
           set -eu
-          kubectl wait \
+          if ! kubectl wait \
             --for=jsonpath='{.status.loadBalancer.ingress[0].ip}' \
             "service/$RELEASE_NAME-grafana" \
             --namespace "$NAMESPACE" \
-            --timeout=5m
+            --timeout=15m; then
+            echo 'Azure did not assign an external IP to Grafana within 15 minutes. Service details and recent namespace events:' >&2
+            kubectl get service "$RELEASE_NAME-grafana" --namespace "$NAMESPACE" --output=wide || true
+            kubectl describe service "$RELEASE_NAME-grafana" --namespace "$NAMESPACE" || true
+            kubectl get events --namespace "$NAMESPACE" --sort-by='.lastTimestamp' | tail -n 40 || true
+            echo 'Check AKS Azure Load Balancer provisioning, outbound connectivity, public IP quota, and Azure permissions.' >&2
+            exit 1
+          fi
           grafana_ip="$(kubectl get service "$RELEASE_NAME-grafana" \
             --namespace "$NAMESPACE" \
             --output=jsonpath='{.status.loadBalancer.ingress[0].ip}')"
